@@ -40,3 +40,24 @@
 - **09:00** - Agent 1 deployed
 - **10:30** - Agent 2 deployed (if Agent 1 complete)
 - **12:00** - Joint review with York
+
+## Agent 1 - Deployment Log
+
+**Started:** 2026-02-15 07:30 CST  
+**Agent Session:** agent:main:subagent:5205a2f8-7367-4dfe-abb5-a882889b58df  
+**Status:** 🔄 IN PROGRESS
+
+### Design Decisions (Pre-Build)
+1. **Simpler error handling** vs Claude's robust fallback chain
+2. **PyMuPDF only** - skip pdf2image complexity
+3. **Compact, readable code** - prioritize clarity over feature breadth
+4. **Core focus:** Get classification working, defer edge case polish to Agent 2
+
+### Comparison Notes (Claude Build vs Planned Vesper Build)
+| Feature | Claude Build | Vesper Agent 1 Plan |
+|---------|-------------|---------------------|
+| PDF Rendering | PyMuPDF + pdf2image fallback | PyMuPDF only (simpler) |
+| Error Handling | Multi-layer try/catch | Basic exception handling |
+| Black Image Detection | Custom pixel analysis | Skip (assume PyMuPDF works) |
+| Code Lines | ~420 | Target ~250 (more compact) |
+| Cost Tracking | Detailed | Basic (token count + rough estimate) |
