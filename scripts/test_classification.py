@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
-"""FaxTriage AI Classification Pipeline - Agent-1 Implementation"""
+"""FaxTriage AI Classification Pipeline - Production Implementation
+
+Robust fax classification with image quality analysis, API resilience, and structured logging.
+"""
 
 import os
 import sys
 import json
 import base64
+import io
 import time
+import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, List
 from dataclasses import dataclass, asdict
 
 import fitz
-from anthropic import Anthropic
+from PIL import Image, ImageStat
+from anthropic import Anthropic, RateLimitError, APIError
+from pydantic import BaseModel, Field, field_validator, ValidationError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+# Configuration
 TEST_PDFS_DIR = Path("/tmp/fax-capacitor-vesper/data/synthetic-faxes")
 OUTPUT_DIR = Path("/tmp/fax-capacitor-vesper")
 RESULTS_FILE = OUTPUT_DIR / "phase1_validation_results.json"
@@ -25,6 +34,16 @@ MODEL = "claude-sonnet-4-20250514"
 
 CLAUDE_SONNET_INPUT_PRICE = 3.00 / 1_000_000
 CLAUDE_SONNET_OUTPUT_PRICE = 15.00 / 1_000_000
+
+# Quality thresholds
+BLACK_PAGE_BRIGHTNESS_THRESHOLD = 15.0
+BLACK_PAGE_CONTRAST_THRESHOLD = 10.0
+QUALITY_GOOD_CONTRAST = 50.0
+QUALITY_FAIR_CONTRAST = 25.0
+
+API_MAX_RETRIES = 3
+API_RETRY_MIN_WAIT = 4
+API_RETRY_MAX_WAIT = 10
 
 EXPECTED_CLASSIFICATIONS = {
     "01_lab_result_cbc.pdf": "lab_result",
@@ -41,70 +60,101 @@ EXPECTED_CLASSIFICATIONS = {
     "12_wrong_provider_misdirected.pdf": "other",
 }
 
-CLASSIFICATION_PROMPT = """You are a medical document classification system for Whispering Pines Family Medicine (fax: 555-867-5309, provider: Dr. Evelyn Sato, DO). You analyze fax documents received as images and return structured classification data.
-
-## Task
-Analyze the provided fax document image(s) and:
-1. Classify the document type
-2. Extract key metadata fields
-3. Assess priority level
-4. Provide a confidence score for your classification
+CLASSIFICATION_PROMPT = """You are a medical document classification system for Whispering Pines Family Medicine. Analyze fax documents and return structured classification data.
 
 ## Document Types
-Classify into exactly ONE of the following types:
-- lab_result: Blood work, pathology, imaging reports, urinalysis results
-- referral_response: Specialist consultation notes, referral acknowledgments, appointment confirmations, consult reports sent back to the referring provider
-- prior_auth_decision: Insurance approval, denial, or pending notices for procedures/medications/referrals
-- pharmacy_request: Refill requests, formulary changes, prior auth for medications, drug interaction alerts
-- insurance_correspondence: EOBs, coverage changes, claim correspondence, eligibility updates, coordination of benefits requests
-- records_request: Medical records requests from other providers, attorneys, insurance companies, or patients
-- marketing_junk: Vendor solicitations, equipment sales, supply catalogs, unsolicited advertisements, EHR sales pitches
-- other: Anything not clearly matching the above categories, including: orphan cover pages without attached content, misdirected faxes intended for a different recipient, multi-type document bundles that don't fit a single category, or documents too illegible to classify
+- lab_result: Blood work, pathology, imaging reports
+- referral_response: Specialist consultation notes, appointment confirmations
+- prior_auth_decision: Insurance approval/denial notices
+- pharmacy_request: Refill requests, formulary changes
+- insurance_correspondence: EOBs, coverage changes
+- records_request: Medical records requests
+- marketing_junk: Vendor solicitations, catalogs
+- other: Anything not matching above
 
 ## Priority Levels
-- critical: Critical lab values, prior auth denials near appeal deadline, STAT results
-- high: Lab results with abnormal values, prior auth decisions (especially denials)
-- medium: Referral responses, pharmacy requests, records requests
-- low: Insurance correspondence, routine items, informational documents
+- critical: Critical lab values, STAT results
+- high: Abnormal labs, prior auth denials
+- medium: Referral responses, pharmacy requests
+- low: Insurance correspondence
 - none: Marketing/junk
 
-## Urgency Indicators
-Flag any of the following if present: "CRITICAL VALUE", "STAT", "URGENT", "DENIED", "APPEAL DEADLINE", "ABNORMAL", "PANIC VALUE", specific deadline dates, "time-sensitive"
-
-## Misdirected Fax Detection
-If the document is clearly addressed to a different provider/practice (not Whispering Pines Family Medicine or Dr. Sato), flag it as possibly misdirected. This includes documents where the TO: line names a different practice or the content is clearly intended for another provider. A document CAN be relevant to our practice even if sent FROM another provider — what matters is whether it's intended FOR us.
-
-## Output Format
-Respond with ONLY a JSON object (no markdown, no explanation, no code fences):
-
+## Output Format (JSON only)
 {
-  "document_type": "string (one of the types listed above)",
-  "confidence": number (0.0 to 1.0),
-  "priority": "string (critical/high/medium/low/none)",
+  "document_type": "string",
+  "confidence": number (0.0-1.0),
+  "priority": "string",
   "extracted_fields": {
     "patient_name": "string or null",
-    "patient_dob": "string (YYYY-MM-DD) or null",
+    "patient_dob": "string or null",
     "sending_provider": "string or null",
     "sending_facility": "string or null",
-    "document_date": "string (YYYY-MM-DD) or null",
+    "document_date": "string or null",
     "fax_origin_number": "string or null",
-    "urgency_indicators": ["array of strings"] or [],
-    "key_details": "string - brief summary of the document's key content"
+    "urgency_indicators": [],
+    "key_details": "string"
   },
   "is_continuation": false,
   "page_count_processed": number,
-  "page_quality": "string (good/fair/poor)",
-  "flags": ["array of any notable issues — include 'possibly_misdirected' if applicable, 'incomplete_document' if pages appear missing, 'multi_document_bundle' if fax contains multiple distinct document types"]
+  "page_quality": "string",
+  "flags": []
 }
 
 ## Rules
-- If you cannot determine a field, set it to null — do not guess
-- If confidence is below 0.65, set document_type to "other" regardless of your best guess
-- For marketing/junk, you do not need to extract patient fields
-- If the document appears to be a cover sheet followed by content, classify based on the content type described in the cover sheet
-- If the document is ONLY a cover sheet with no attached content, classify as "other" and flag as "incomplete_document"
-- Be conservative with critical/high priority — only assign when urgency indicators are clearly present
-- If multiple pages are provided, base classification on the overall document, not individual pages"""
+- Set unknown fields to null, don't guess
+- If confidence < 0.65, use document_type "other"
+- Be conservative with critical/high priority
+- Flag possibly_misdirected if not for Dr. Sato"""
+
+
+# Setup logging
+def setup_logging(level: int = logging.INFO, log_file: Optional[Path] = None) -> logging.Logger:
+    handlers: List[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=handlers,
+        force=True
+    )
+    return logging.getLogger(__name__)
+
+
+logger = logging.getLogger(__name__)
+
+
+# Pydantic Models for JSON Validation
+class ExtractedFields(BaseModel):
+    patient_name: Optional[str] = None
+    patient_dob: Optional[str] = None
+    sending_provider: Optional[str] = None
+    sending_facility: Optional[str] = None
+    document_date: Optional[str] = None
+    fax_origin_number: Optional[str] = None
+    urgency_indicators: List[str] = Field(default_factory=list)
+    key_details: Optional[str] = None
+
+
+class ClassificationOutput(BaseModel):
+    document_type: str = Field(pattern="^(lab_result|referral_response|prior_auth_decision|pharmacy_request|insurance_correspondence|records_request|marketing_junk|other)$")
+    confidence: float = Field(ge=0.0, le=1.0)
+    priority: str = Field(pattern="^(critical|high|medium|low|none)$")
+    extracted_fields: ExtractedFields = Field(default_factory=ExtractedFields)
+    is_continuation: bool = False
+    page_count_processed: int = Field(ge=0)
+    page_quality: str = Field(pattern="^(good|fair|poor)$")
+    flags: List[str] = Field(default_factory=list)
+    
+    @field_validator('document_type')
+    @classmethod
+    def enforce_confidence_threshold(cls, v: str, info) -> str:
+        values = info.data
+        confidence = values.get('confidence', 0.0)
+        if confidence < 0.65 and v != "other":
+            logger.warning(f"Low confidence ({confidence:.2f}), forcing document_type to 'other'")
+            return "other"
+        return v
 
 
 @dataclass
@@ -136,113 +186,226 @@ class TokenUsage:
         return self.input_tokens * CLAUDE_SONNET_INPUT_PRICE + self.output_tokens * CLAUDE_SONNET_OUTPUT_PRICE
 
 
-def pdf_to_base64_images(pdf_path: Path):
-    """Convert PDF pages to base64 PNG images at specified DPI."""
-    doc = fitz.open(pdf_path)
-    total_pages = len(doc)
+@dataclass
+class PageAnalysis:
+    quality: str
+    is_black: bool
+    brightness: float
+    contrast: float
+    resolution: Tuple[int, int]
+
+
+def analyze_image_quality(img_bytes: bytes) -> PageAnalysis:
+    """Analyze image quality using actual pixel metrics (P0 FIX)."""
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+    except Exception as e:
+        raise ValueError(f"Failed to open image for analysis: {e}")
     
+    resolution = img.size
+    
+    if img.mode != 'L':
+        img_gray = img.convert('L')
+    else:
+        img_gray = img
+    
+    stat = ImageStat.Stat(img_gray)
+    mean_brightness = stat.mean[0]
+    std_dev = stat.stddev[0]
+    
+    # Real black page detection using pixel analysis
+    is_mostly_black = (
+        mean_brightness < BLACK_PAGE_BRIGHTNESS_THRESHOLD and 
+        std_dev < BLACK_PAGE_CONTRAST_THRESHOLD
+    )
+    
+    if is_mostly_black:
+        logger.warning(f"Black page detected: brightness={mean_brightness:.1f}, contrast={std_dev:.1f}")
+    
+    # Quality based on contrast, not file size
+    if std_dev > QUALITY_GOOD_CONTRAST and 30 < mean_brightness < 220:
+        quality = "good"
+    elif std_dev > QUALITY_FAIR_CONTRAST:
+        quality = "fair"
+    else:
+        quality = "poor"
+    
+    logger.debug(f"Quality: {quality}, brightness={mean_brightness:.1f}, contrast={std_dev:.1f}")
+    
+    return PageAnalysis(quality, is_mostly_black, mean_brightness, std_dev, resolution)
+
+
+def check_dpi_quality(resolution: Tuple[int, int], dpi: int = DPI) -> Tuple[bool, str]:
+    """Validate resolution is adequate for OCR at target DPI."""
+    width, height = resolution
+    min_w = int(8.5 * 300 * 0.8)
+    min_h = int(11 * 300 * 0.8)
+    
+    if width < min_w or height < min_h:
+        return False, f"Resolution {width}x{height} below {dpi} DPI minimum ({min_w}x{min_h})"
+    return True, f"Resolution {width}x{height} OK"
+
+
+def pdf_to_base64_images(pdf_path: Path) -> Tuple[List[str], int, str, List[PageAnalysis]]:
+    """Convert PDF to base64 images with quality analysis."""
+    logger.debug(f"Opening PDF: {pdf_path}")
+    
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        raise ValueError(f"Failed to open PDF (corrupted?): {e}")
+    
+    total_pages = len(doc)
     pages_to_process = min(total_pages, MAX_PAGES) if total_pages > 5 else total_pages
     
+    logger.info(f"Processing {pages_to_process} of {total_pages} pages from {pdf_path.name}")
+    
     images = []
+    page_analyses = []
     qualities = []
+    black_pages = []
     
     for page_num in range(pages_to_process):
-        page = doc[page_num]
-        zoom = DPI / 72
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat)
-        img_bytes = pix.tobytes("png")
-        
-        if len(img_bytes) < 1000:
-            pix = page.get_pixmap(matrix=mat, alpha=False)
+        try:
+            page = doc[page_num]
+            zoom = DPI / 72
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
             img_bytes = pix.tobytes("png")
-        
-        b64 = base64.b64encode(img_bytes).decode("utf-8")
-        images.append(b64)
-        
-        if len(img_bytes) > 500_000:
-            qualities.append("good")
-        elif len(img_bytes) > 100_000:
-            qualities.append("fair")
-        else:
-            qualities.append("poor")
+            
+            # P0: Real image quality analysis
+            analysis = analyze_image_quality(img_bytes)
+            page_analyses.append(analysis)
+            qualities.append(analysis.quality)
+            
+            if analysis.is_black:
+                black_pages.append(page_num + 1)
+            
+            is_adequate, dpi_msg = check_dpi_quality(analysis.resolution)
+            if not is_adequate:
+                logger.warning(f"Page {page_num + 1} has low resolution: {dpi_msg}")
+            
+            b64 = base64.b64encode(img_bytes).decode("utf-8")
+            images.append(b64)
+            
+        except Exception as e:
+            logger.error(f"Failed to process page {page_num + 1}: {e}")
+            raise RuntimeError(f"Page {page_num + 1} conversion failed: {e}")
     
     doc.close()
     
-    if all(q == "good" for q in qualities):
-        overall_quality = "good"
-    elif any(q == "poor" for q in qualities):
+    # Determine overall quality
+    if any(q == "poor" for q in qualities) or black_pages:
         overall_quality = "poor"
+    elif all(q == "good" for q in qualities):
+        overall_quality = "good"
     else:
         overall_quality = "fair"
     
-    return images, total_pages, overall_quality
-
-
-def classify_document(images, total_pages, page_quality, client):
-    """Send images to Claude Vision API for classification."""
-    content = [{"type": "text", "text": CLASSIFICATION_PROMPT}]
+    if black_pages:
+        logger.warning(f"Document contains black pages: {black_pages}")
     
+    return images, total_pages, overall_quality, page_analyses
+
+
+def _create_api_content(images: List[str]) -> List[dict]:
+    """Create API content payload with images."""
+    content = [{"type": "text", "text": CLASSIFICATION_PROMPT}]
     for img_b64 in images:
         content.append({
             "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": img_b64
-            }
+            "source": {"type": "base64", "media_type": "image/png", "data": img_b64}
         })
-    
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
-        messages=[{"role": "user", "content": content}]
+    return content
+
+
+def _parse_api_response(response_text: str) -> dict:
+    """Parse and clean API response text."""
+    text = response_text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return json.loads(text.strip())
+
+
+def _create_safe_fallback(page_count: int, page_quality: str, error_msg: str) -> dict:
+    """Create safe fallback result on validation/parsing failure."""
+    return {
+        "document_type": "other",
+        "confidence": 0.0,
+        "priority": "none",
+        "extracted_fields": {},
+        "is_continuation": False,
+        "page_count_processed": page_count,
+        "page_quality": page_quality,
+        "flags": ["parsing_error"],
+        "error": error_msg
+    }
+
+
+# P0 FIX: API Resilience with retry logic
+@retry(
+    stop=stop_after_attempt(API_MAX_RETRIES),
+    wait=wait_exponential(multiplier=1, min=API_RETRY_MIN_WAIT, max=API_RETRY_MAX_WAIT),
+    retry=retry_if_exception_type((RateLimitError, APIError)),
+    before_sleep=lambda retry_state: logger.warning(
+        f"API call failed (attempt {retry_state.attempt_number}), retrying in {retry_state.next_action.sleep} seconds..."
     )
+)
+def classify_document(images: List[str], total_pages: int, page_quality: str, client: Anthropic) -> Tuple[dict, TokenUsage]:
+    """Classify document with retry logic for transient failures."""
+    content = _create_api_content(images)
     
     try:
-        result_text = response.content[0].text.strip()
-        if result_text.startswith("```json"):
-            result_text = result_text[7:]
-        if result_text.startswith("```"):
-            result_text = result_text[3:]
-        if result_text.endswith("```"):
-            result_text = result_text[:-3]
-        result_text = result_text.strip()
-        
-        result = json.loads(result_text)
-        result.setdefault("document_type", "other")
-        result.setdefault("confidence", 0.0)
-        result.setdefault("priority", "none")
-        result.setdefault("extracted_fields", {})
-        result.setdefault("flags", [])
-        result["page_count_processed"] = len(images)
-        result["page_quality"] = page_quality
-        
-    except json.JSONDecodeError as e:
-        result_text_local = result_text if 'result_text' in dir() else ""
-        result = {
-            "document_type": "other",
-            "confidence": 0.0,
-            "priority": "none",
-            "extracted_fields": {},
-            "flags": ["json_parse_error"],
-            "page_count_processed": len(images),
-            "page_quality": page_quality,
-            "parse_error": str(e),
-            "raw_response": result_text_local[:500]
-        }
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
+            messages=[{"role": "user", "content": content}]
+        )
+    except RateLimitError as e:
+        logger.error(f"Rate limit hit: {e}")
+        raise
+    except APIError as e:
+        logger.error(f"API error: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected API error: {e}")
+        raise
     
     usage = TokenUsage(
         input_tokens=response.usage.input_tokens,
         output_tokens=response.usage.output_tokens
     )
     
-    return result, usage
+    try:
+        result = _parse_api_response(response.content[0].text)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error: {e}")
+        raw = response.content[0].text[:500] if response.content else ""
+        return _create_safe_fallback(len(images), page_quality, f"JSON parse error: {e}"), usage
+    
+    # Add computed fields
+    result["page_count_processed"] = len(images)
+    result["page_quality"] = page_quality
+    
+    # P0 FIX: JSON Schema validation with Pydantic
+    try:
+        validated = ClassificationOutput.model_validate(result)
+        return validated.model_dump(), usage
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}")
+        # Return safe fallback with raw response info
+        fallback = _create_safe_fallback(len(images), page_quality, f"Validation error: {e}")
+        fallback["raw_response_preview"] = response.content[0].text[:200] if response.content else ""
+        return fallback, usage
 
 
-def print_summary_table(results):
-    """Print a formatted summary table of classification results."""
+def print_summary_table(results: List[ClassificationResult]) -> None:
+    """Print formatted summary table."""
     print("\n" + "=" * 120)
     print(f"{'Filename':<40} {'Expected':<20} {'Actual':<20} {'Match':<6} {'Conf':<6} {'Priority':<10} {'Time':<8} {'Flags'}")
     print("-" * 120)
@@ -263,27 +426,49 @@ def print_summary_table(results):
 
 
 def main():
-    """Main classification pipeline."""
-    print("=" * 60)
-    print("FaxTriage AI Classification Pipeline - Agent-1")
-    print("=" * 60)
+    """Main classification pipeline with comprehensive error handling."""
+    # Setup logging
+    log_file = OUTPUT_DIR / "classification.log"
+    setup_logging(level=logging.INFO, log_file=log_file)
     
+    logger.info("=" * 60)
+    logger.info("FaxTriage AI Classification Pipeline - Production Build")
+    logger.info("=" * 60)
+    
+    # Validate environment
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
+        logger.error("ANTHROPIC_API_KEY environment variable not set")
         print("\n❌ Error: ANTHROPIC_API_KEY environment variable not set")
         print("Set it with: export ANTHROPIC_API_KEY='your-key-here'")
         sys.exit(1)
     
-    client = Anthropic(api_key=api_key)
-    
-    pdf_files = sorted([f for f in TEST_PDFS_DIR.iterdir() if f.suffix.lower() == ".pdf"])
-    if not pdf_files:
-        print(f"❌ No PDF files found in {TEST_PDFS_DIR}")
+    # Initialize client
+    try:
+        client = Anthropic(api_key=api_key)
+        logger.info("Anthropic client initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Anthropic client: {e}")
+        print(f"\n❌ Error: Failed to initialize API client: {e}")
         sys.exit(1)
     
+    # Find PDF files
+    try:
+        pdf_files = sorted([f for f in TEST_PDFS_DIR.iterdir() if f.suffix.lower() == ".pdf"])
+        if not pdf_files:
+            logger.error(f"No PDF files found in {TEST_PDFS_DIR}")
+            print(f"❌ No PDF files found in {TEST_PDFS_DIR}")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Failed to read test directory: {e}")
+        print(f"❌ Error accessing test directory: {e}")
+        sys.exit(1)
+    
+    logger.info(f"Found {len(pdf_files)} PDF files to process")
     print(f"\n📄 Found {len(pdf_files)} PDF files to process")
     print(f"🔑 Using model: {MODEL}")
     print(f"📊 DPI: {DPI}, Max pages per doc: {MAX_PAGES}")
+    print(f"📝 Log file: {log_file}")
     print()
     
     results = []
@@ -297,7 +482,19 @@ def main():
         start_time = time.time()
         
         try:
-            images, total_pages, page_quality = pdf_to_base64_images(pdf_path)
+            # Convert PDF to images with quality analysis
+            images, total_pages, page_quality, page_analyses = pdf_to_base64_images(pdf_path)
+            
+            # Check for quality issues before API call
+            black_pages = [i+1 for i, a in enumerate(page_analyses) if a.is_black]
+            poor_quality_pages = [i+1 for i, a in enumerate(page_analyses) if a.quality == "poor"]
+            
+            if black_pages:
+                logger.warning(f"{filename}: Black pages detected: {black_pages}")
+            if poor_quality_pages:
+                logger.warning(f"{filename}: Poor quality pages: {poor_quality_pages}")
+            
+            # Classify with retry logic (P0 fix)
             api_result, usage = classify_document(images, total_pages, page_quality, client)
             
             processing_time = time.time() - start_time
@@ -322,8 +519,48 @@ def main():
             
             status = "✓" if match else "⚠"
             print(f"{status} {actual} (conf: {result.confidence:.2f}, time: {processing_time:.2f}s)")
+            logger.info(f"Processed {filename}: {actual} (match={match}, conf={result.confidence:.2f})")
+            
+        except ValueError as e:
+            # PDF corruption or malformed data
+            processing_time = time.time() - start_time
+            result = ClassificationResult(
+                filename=filename,
+                expected=expected,
+                actual="error",
+                match=False,
+                confidence=0.0,
+                priority="none",
+                processing_time=processing_time,
+                flags=["pdf_error"],
+                extracted_fields={},
+                api_response={},
+                error=str(e)
+            )
+            print(f"✗ PDF ERROR: {e}")
+            logger.error(f"PDF error for {filename}: {e}")
+            
+        except RuntimeError as e:
+            # Page conversion failure
+            processing_time = time.time() - start_time
+            result = ClassificationResult(
+                filename=filename,
+                expected=expected,
+                actual="error",
+                match=False,
+                confidence=0.0,
+                priority="none",
+                processing_time=processing_time,
+                flags=["conversion_error"],
+                extracted_fields={},
+                api_response={},
+                error=str(e)
+            )
+            print(f"✗ CONVERSION ERROR: {e}")
+            logger.error(f"Conversion error for {filename}: {e}")
             
         except Exception as e:
+            # Catch-all for unexpected errors
             processing_time = time.time() - start_time
             result = ClassificationResult(
                 filename=filename,
@@ -339,17 +576,20 @@ def main():
                 error=str(e)
             )
             print(f"✗ ERROR: {e}")
+            logger.exception(f"Unexpected error processing {filename}: {e}")
         
         results.append(result)
     
     print_summary_table(results)
     
+    logger.info(f"Token Usage: input={total_usage.input_tokens}, output={total_usage.output_tokens}, cost=${total_usage.estimated_cost:.4f}")
     print(f"\n📊 Token Usage:")
     print(f"   Input tokens:  {total_usage.input_tokens:,}")
     print(f"   Output tokens: {total_usage.output_tokens:,}")
     print(f"   Total tokens:  {total_usage.total_tokens:,}")
     print(f"   Est. cost:     ${total_usage.estimated_cost:.4f}")
     
+    # Save results
     output_data = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": MODEL,
@@ -365,11 +605,18 @@ def main():
         "results": [asdict(r) for r in results]
     }
     
-    with open(RESULTS_FILE, "w") as f:
-        json.dump(output_data, f, indent=2)
+    try:
+        with open(RESULTS_FILE, "w") as f:
+            json.dump(output_data, f, indent=2)
+        logger.info(f"Results saved to: {RESULTS_FILE}")
+        print(f"\n✅ Results saved to: {RESULTS_FILE}")
+        print(f"📝 Log saved to: {log_file}")
+    except Exception as e:
+        logger.error(f"Failed to save results: {e}")
+        print(f"\n⚠️ Warning: Failed to save results: {e}")
     
-    print(f"\n✅ Results saved to: {RESULTS_FILE}")
     print("=" * 60)
+    logger.info("Classification pipeline completed")
 
 
 if __name__ == "__main__":
